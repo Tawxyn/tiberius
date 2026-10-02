@@ -26,7 +26,8 @@ pub enum ReceivedToken {
     DoneInProc(TokenDone),
     DoneProc(TokenDone),
     ReturnStatus(u32),
-    ReturnValue(TokenReturnValue),
+    // Boxed: an inline return value would make every row token 304 bytes.
+    ReturnValue(Box<TokenReturnValue>),
     Order(TokenOrder),
     ColName(TokenColName),
     TabName(TokenTabName),
@@ -184,7 +185,7 @@ where
     async fn get_return_value(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenReturnValue::decode(self.conn).await?;
         event!(Level::TRACE, message = ?return_value);
-        Ok(ReceivedToken::ReturnValue(return_value))
+        Ok(ReceivedToken::ReturnValue(Box::new(return_value)))
     }
 
     async fn get_return_status(&mut self) -> crate::Result<ReceivedToken> {

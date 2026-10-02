@@ -681,7 +681,7 @@ where
                     });
                 }
             }
-            ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
+            ReceivedToken::ReturnValue(rv) => outputs.push((*rv).into()),
             ReceivedToken::Error(e) => {
                 last_error.get_or_insert(crate::Error::Server(e));
             }

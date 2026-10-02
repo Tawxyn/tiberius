@@ -17,7 +17,7 @@ use crate::{
     EncryptionLevel, SqlReadBytes,
 };
 use asynchronous_codec::Framed;
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
 use codec::TokenSspi;
 use futures_util::future::{select, Either};
@@ -616,7 +616,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
                 match item {
                     Ok(packet) => {
                         let (_, payload) = packet.into_parts();
-                        this.buf.extend(payload);
+                        this.buf.extend_from_slice(&payload);
 
                         if this.buf.len() >= size {
                             break;
@@ -640,7 +640,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
             }
         }
 
-        buf.copy_from_slice(this.buf.split_to(size).as_ref());
+        buf.copy_from_slice(&this.buf[..size]);
+        this.buf.advance(size);
         Poll::Ready(Ok(size))
     }
 }

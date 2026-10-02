@@ -669,6 +669,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             results,
         ))
     }
+
+    /// Prepares and executes `sql` in one round trip, like
+    /// [`prep_exec`](Self::prep_exec), but returns the first execution's row
+    /// counts instead of its rows, as
+    /// [`execute_declared_until_error`](Self::execute_declared_until_error)
+    /// does.
+    ///
+    /// The statement is returned whenever the server assigned a handle, even
+    /// when the execution failed, so the caller can still release it.
+    pub async fn prep_exec_until_error<'a>(
+        &mut self,
+        sql: impl Into<Cow<'a, str>>,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&'a dyn ToSql],
+    ) -> (
+        Option<PreparedStatement>,
+        ExecuteResult,
+        Option<crate::Error>,
+    ) {
+        let sql: Cow<'a, str> = sql.into();
+        let param_defs: Cow<'a, str> = param_defs.into();
+        let sql_owned = sql.to_string();
+        let defs_owned = param_defs.to_string();
+
+        if let Err(error) = self.connection.flush_stream().await {
+            return (None, ExecuteResult::empty(), Some(error));
+        }
+        let rpc_params = prepared::build_prepexec_params(sql, param_defs, params);
+        if let Err(error) = self.send_rpc(RpcProcId::PrepExec, rpc_params).await {
+            return (None, ExecuteResult::empty(), Some(error));
+        }
+
+        let mut outputs: Vec<OutputValue> = Vec::new();
+        let (result, error) = ExecuteResult::until_error_visiting(&mut self.connection, |token| {
+            if let ReceivedToken::ReturnValue(value) = token {
+                outputs.push((*value).into());
+            }
+        })
+        .await;
+        let statement = prepared::extract_handle(&outputs)
+            .ok()
+            .map(|handle| PreparedStatement::new(handle, sql_owned, defs_owned));
+        (statement, result, error)
+    }
 }
 
 /// Drain the response of an `sp_prepexec` call: collect all result sets into

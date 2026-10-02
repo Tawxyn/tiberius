@@ -150,6 +150,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         ExecuteResult::new(&mut self.connection).await
     }
 
+    /// Executes `query` through `sp_executesql` with the caller's parameter
+    /// declarations, such as `"@P1 int, @P2 nvarchar(10)"`, rather than ones
+    /// derived from each value. Values are passed as `@P1` onward, in order.
+    ///
+    /// Returns the row counts the server reported before the first error,
+    /// with that error, or `None` when the execution succeeded. Counts
+    /// reported after the error are dropped, even when later statements of a
+    /// multi-statement batch ran.
+    pub async fn execute_declared_until_error<'a>(
+        &mut self,
+        query: impl Into<Cow<'a, str>>,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>) {
+        if let Err(error) = self.connection.flush_stream().await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        let mut rpc_params = Self::rpc_params(query);
+        rpc_params[1].value = ColumnData::String(Some(param_defs.into()));
+        for (index, param) in params.iter().enumerate() {
+            rpc_params.push(RpcParam {
+                name: Cow::Owned(format!("@P{}", index + 1)),
+                flags: BitFlags::empty(),
+                type_info: None,
+                value: param.to_sql(),
+            });
+        }
+        if let Err(error) = self.send_rpc(RpcProcId::ExecuteSQL, rpc_params).await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        ExecuteResult::until_error(&mut self.connection).await
+    }
+
     /// Executes SQL statements in the SQL Server, returning resulting rows.
     /// Useful for `SELECT` statements. The `query` can define the parameter
     /// placement by annotating them with `@PN`, where N is the index of the

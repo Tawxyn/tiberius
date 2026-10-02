@@ -39,7 +39,7 @@ use crate::{
 };
 use codec::{
     BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, RpcProcIdValue, TokenRpcBatch,
-    TokenRpcRequest,
+    TokenRpcRequest, TransactionOutcome, TransactionRequest,
 };
 use enumflags2::BitFlags;
 use futures_util::io::{AsyncRead, AsyncWrite};
@@ -299,6 +299,48 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         result.forward_to_metadata().await?;
 
         Ok(result)
+    }
+
+    /// Whether the server has reported an open transaction on this
+    /// connection. It sends the transaction's descriptor when one begins,
+    /// including an implicit transaction, and clears it when one ends.
+    pub fn transaction_open(&self) -> bool {
+        self.connection.context().transaction_descriptor() != [0; 8]
+    }
+
+    /// Commits the session's transaction with a transaction manager request,
+    /// which the server runs without compiling a batch. Returns `false`
+    /// without contacting the server when the server has reported no open
+    /// transaction on this connection.
+    pub async fn commit_transaction(&mut self) -> crate::Result<bool> {
+        self.end_transaction(TransactionOutcome::Commit).await
+    }
+
+    /// Rolls back the session's transaction as
+    /// [`commit_transaction`](Self::commit_transaction) commits it.
+    pub async fn rollback_transaction(&mut self) -> crate::Result<bool> {
+        self.end_transaction(TransactionOutcome::Rollback).await
+    }
+
+    async fn end_transaction(&mut self, outcome: TransactionOutcome) -> crate::Result<bool> {
+        self.connection.flush_stream().await?;
+        let descriptor = self.connection.context().transaction_descriptor();
+        if descriptor == [0; 8] {
+            return Ok(false);
+        }
+
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection
+            .send(
+                PacketHeader::transaction_manager(id),
+                TransactionRequest::new(outcome, descriptor),
+            )
+            .await?;
+        // The server's ENVCHANGE for the commit or rollback clears the
+        // descriptor while the response is read.
+        let mut tokens = TokenStream::new(&mut self.connection).try_unfold();
+        while tokens.try_next().await?.is_some() {}
+        Ok(true)
     }
 
     /// Execute a `BULK INSERT` statement, efficiantly storing a large number of

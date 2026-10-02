@@ -11,6 +11,7 @@ mod packet;
 mod pre_login;
 mod rpc_request;
 mod token;
+mod transaction_request;
 mod type_info;
 
 pub use batch_request::*;
@@ -27,6 +28,7 @@ pub use packet::*;
 pub use pre_login::*;
 pub use rpc_request::*;
 pub use token::*;
+pub(crate) use transaction_request::*;
 pub use type_info::*;
 
 pub(crate) const HEADER_BYTES: usize = 8;

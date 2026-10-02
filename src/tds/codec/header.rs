@@ -98,6 +98,13 @@ impl PacketHeader {
         header
     }
 
+    pub fn transaction_manager(id: u8) -> Self {
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::TransactionManagerReq);
+        header.set_status(PacketStatus::NormalMessage);
+        header
+    }
+
     pub fn bulk_load(id: u8) -> Self {
         let mut header = Self::new(0, id);
         header.set_type(PacketType::BulkLoad);

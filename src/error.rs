@@ -68,7 +68,22 @@ pub enum Error {
     /// [`CancellationToken`](crate::CancellationToken); a TDS attention signal
     /// was sent and the response drained. The connection remains usable.
     Canceled,
+    #[error("{error}; the cleanup that followed also failed: {cleanup}")]
+    /// A request failed with `error`, and the cleanup that followed it, such
+    /// as releasing a prepared statement, failed with `cleanup`.
+    /// [`code`](Self::code) reports `error`'s code, and
+    /// [`leaves_connection_usable`](Self::leaves_connection_usable) accounts
+    /// for both.
+    CleanupFailed {
+        /// The request's error.
+        error: Box<Error>,
+        /// The cleanup's error.
+        cleanup: Box<Error>,
+    },
 }
+
+/// The lowest severity at which SQL Server ends the connection after an error.
+const FATAL_SEVERITY: u8 = 20;
 
 impl Error {
     /// True, if the error was caused by a deadlock.
@@ -81,7 +96,45 @@ impl Error {
     pub fn code(&self) -> Option<u32> {
         match self {
             Error::Server(e) => Some(e.code()),
+            Error::CleanupFailed { error, .. } => error.code(),
             _ => None,
+        }
+    }
+
+    /// Whether the connection is known to be able to carry another request
+    /// after a request failed with this error. When it is not, the
+    /// connection should be discarded.
+    ///
+    /// A server error arrives in a response that is read to its end, and a
+    /// cancellation ends when the server acknowledges the attention. A
+    /// server error of severity 20 or higher is fatal, though, and the server
+    /// ends the connection after sending it. Any other error, such as an I/O
+    /// or protocol error, can stop reading in the middle of a response or a
+    /// packet, so it reports `false`, even for an error the client raised
+    /// without touching the connection.
+    pub fn leaves_connection_usable(&self) -> bool {
+        match self {
+            Error::Server(error) => error.class() < FATAL_SEVERITY,
+            Error::Canceled => true,
+            Error::CleanupFailed { error, cleanup } => {
+                error.leaves_connection_usable() && cleanup.leaves_connection_usable()
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns a request's error together with that of the cleanup that
+    /// followed it: the request's error alone when the cleanup succeeded, the
+    /// cleanup's when only it failed, and [`CleanupFailed`](Self::CleanupFailed)
+    /// when both did.
+    pub(crate) fn with_cleanup(error: Option<Error>, cleanup: crate::Result<()>) -> Option<Error> {
+        match (error, cleanup) {
+            (error, Ok(())) => error,
+            (None, Err(cleanup)) => Some(cleanup),
+            (Some(error), Err(cleanup)) => Some(Error::CleanupFailed {
+                error: Box::new(error),
+                cleanup: Box::new(cleanup),
+            }),
         }
     }
 }
@@ -160,5 +213,78 @@ impl From<connection_string::Error> for Error {
 impl From<libgssapi::error::Error> for Error {
     fn from(err: libgssapi::error::Error) -> Error {
         Error::Gssapi(format!("{}", err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_error(code: u32) -> Error {
+        Error::Server(TokenError::new(code, 1, 16, "e", "srv", "", 1))
+    }
+
+    fn broken_pipe() -> Error {
+        Error::Io {
+            kind: IoErrorKind::BrokenPipe,
+            message: "broken pipe".into(),
+        }
+    }
+
+    #[test]
+    fn with_cleanup_keeps_a_cleanup_failure_alongside_the_request_error() {
+        assert_eq!(Error::with_cleanup(None, Ok(())), None);
+        assert_eq!(
+            Error::with_cleanup(Some(server_error(2627)), Ok(())),
+            Some(server_error(2627))
+        );
+        assert_eq!(
+            Error::with_cleanup(None, Err(broken_pipe())),
+            Some(broken_pipe())
+        );
+        assert_eq!(
+            Error::with_cleanup(Some(server_error(2627)), Err(broken_pipe())),
+            Some(Error::CleanupFailed {
+                error: Box::new(server_error(2627)),
+                cleanup: Box::new(broken_pipe()),
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_reports_the_request_code_and_both_connection_states() {
+        let failed = |error, cleanup| Error::CleanupFailed {
+            error: Box::new(error),
+            cleanup: Box::new(cleanup),
+        };
+
+        let after_io = failed(server_error(2627), broken_pipe());
+        assert_eq!(after_io.code(), Some(2627));
+        assert!(!after_io.leaves_connection_usable());
+
+        let after_server_error = failed(server_error(2627), server_error(8179));
+        assert_eq!(after_server_error.code(), Some(2627));
+        assert!(after_server_error.leaves_connection_usable());
+
+        assert!(
+            !failed(Error::Canceled, Error::Protocol("bad token".into()))
+                .leaves_connection_usable()
+        );
+        assert!(failed(Error::Canceled, Error::Canceled).leaves_connection_usable());
+
+        let after_fatal = failed(server_error(2627), server_error_of_severity(20));
+        assert_eq!(after_fatal.code(), Some(2627));
+        assert!(!after_fatal.leaves_connection_usable());
+    }
+
+    fn server_error_of_severity(class: u8) -> Error {
+        Error::Server(TokenError::new(50000, 1, class, "e", "srv", "", 1))
+    }
+
+    #[test]
+    fn a_fatal_server_error_leaves_the_connection_unusable() {
+        assert!(server_error_of_severity(19).leaves_connection_usable());
+        assert!(!server_error_of_severity(20).leaves_connection_usable());
+        assert!(!server_error_of_severity(25).leaves_connection_usable());
     }
 }

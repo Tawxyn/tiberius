@@ -145,6 +145,67 @@ impl PreparedStatement {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        self.release(client).await
+    }
+
+    /// Executes the statement a last time and then releases it, as
+    /// [`execute`](Self::execute) followed by [`unprepare`](Self::unprepare)
+    /// would. Returns the row counts reported before the execution's first
+    /// error, with that error.
+    ///
+    /// The release is attempted even when the execution fails or is
+    /// canceled, as long as the connection can still carry a request. When
+    /// both fail, the error is [`CleanupFailed`](crate::error::Error::CleanupFailed),
+    /// which keeps the execution's error and its code. An execution error
+    /// that leaves the connection unusable, such as an I/O or protocol error,
+    /// is returned without attempting the release. Whenever the error's
+    /// [`leaves_connection_usable`](crate::error::Error::leaves_connection_usable)
+    /// is `false`, the connection should be discarded, which frees the
+    /// handle.
+    pub async fn execute_and_unprepare<S>(
+        mut self,
+        client: &mut Client<S>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        // The release is not sent in the execution's request: an attention
+        // aborts the whole request it interrupts, so a release that had not
+        // yet run would be lost along with this consumed statement.
+        let (result, error) = self.execute_until_error(client, params).await;
+        if error
+            .as_ref()
+            .is_some_and(|error| !error.leaves_connection_usable())
+        {
+            return (result, error);
+        }
+        let released = self.release(client).await;
+        (result, crate::Error::with_cleanup(error, released))
+    }
+
+    async fn execute_until_error<S>(
+        &self,
+        client: &mut Client<S>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        if let Err(error) = client.connection.flush_stream().await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        let rpc_params = build_execute_params(self.handle, params);
+        if let Err(error) = client.send_rpc(RpcProcId::Execute, rpc_params).await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        ExecuteResult::until_error(&mut client.connection).await
+    }
+
+    async fn release<S>(&mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         client.connection.flush_stream().await?;
         let handle_param = RpcParam {
             name: Cow::Borrowed(""),
@@ -161,45 +222,6 @@ impl PreparedStatement {
         self.released = true;
         collect_rpc_outputs(&mut client.connection).await?;
         Ok(())
-    }
-
-    /// Executes the statement a last time and releases it in the same
-    /// request, saving the round trip of a separate
-    /// [`unprepare`](Self::unprepare).
-    ///
-    /// Returns the row counts reported before the first error, with that
-    /// error. A procedure the statement runs can end its own results inside
-    /// the response, so an error from the release cannot be told apart from
-    /// one in the execution; either is returned as the error.
-    pub async fn execute_and_unprepare<S>(
-        mut self,
-        client: &mut Client<S>,
-        params: &[&dyn ToSql],
-    ) -> (ExecuteResult, Option<crate::Error>)
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        if let Err(error) = client.connection.flush_stream().await {
-            return (ExecuteResult::empty(), Some(error));
-        }
-        let handle_param = RpcParam {
-            name: Cow::Borrowed(""),
-            flags: BitFlags::empty(),
-            type_info: None,
-            value: ColumnData::I32(Some(self.handle.as_i32())),
-        };
-        let calls = vec![
-            (
-                RpcProcId::Execute.into(),
-                build_execute_params(self.handle, params),
-            ),
-            (RpcProcId::Unprepare.into(), vec![handle_param]),
-        ];
-        if let Err(error) = client.send_rpc_batch(calls).await {
-            return (ExecuteResult::empty(), Some(error));
-        }
-        self.released = true;
-        ExecuteResult::until_error(&mut client.connection).await
     }
 }
 

@@ -31,8 +31,9 @@ use tiberius::server::{
 };
 use tiberius::{
     BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions,
-    CursorScrollOptions, EncryptionLevel, FixedLenType, MetaDataColumn, ProcedureParameter,
-    TokenColMetaData, TokenDone, TokenInfo, TypeInfo, VarLenContext, VarLenType,
+    CursorScrollOptions, DoneStatus, EncryptionLevel, FixedLenType, MetaDataColumn,
+    ProcedureParameter, TokenColMetaData, TokenDone, TokenInfo, TypeInfo, VarLenContext,
+    VarLenType,
 };
 
 // =============================================================================
@@ -175,6 +176,15 @@ struct SharedState {
     /// tokens and instead polls for an attention, simulating a stalled probe.
     /// Used to exercise cancellation of the metadata-fetch read path.
     stall_metadata_fetch: Mutex<bool>,
+    /// When set, `sp_cursorclose` fails with a server error, as it does for a
+    /// cursor the server has already closed.
+    fail_cursor_close: Mutex<bool>,
+    /// When set, `sp_unprepare` and `sp_cursorunprepare` drop the connection
+    /// instead of answering, so the client's release fails with an I/O error.
+    drop_on_release: Mutex<bool>,
+    /// When set, `sp_unprepare` fails with a fatal server error and then
+    /// drops the connection.
+    fatal_on_release: Mutex<bool>,
     rpc_log: Mutex<Vec<RpcProcId>>,
 }
 
@@ -189,6 +199,9 @@ impl SharedState {
             cursorprepexec_send_metadata: Mutex::new(false),
             cursorprepexec_allow_direct: Mutex::new(false),
             stall_metadata_fetch: Mutex::new(false),
+            fail_cursor_close: Mutex::new(false),
+            drop_on_release: Mutex::new(false),
+            fatal_on_release: Mutex::new(false),
             rpc_log: Mutex::new(Vec::new()),
         }
     }
@@ -327,6 +340,32 @@ impl SpPrepareHandler for TestPrepare {
     }
 }
 
+/// Prepared SQL that makes [`TestExecute`] send nothing until an attention
+/// arrives, like a long-running statement.
+const STALLED_EXECUTE_SQL: &str = "/* stalled-execute-probe */ SELECT @P1 AS v";
+
+/// Prepared SQL that makes [`TestExecute`] fail with a server error.
+const FAILING_EXECUTE_SQL: &str = "/* failing-execute-probe */ SELECT @P1 AS v";
+
+/// Prepared SQL that makes [`TestExecute`] fail with a fatal server error.
+const FATAL_EXECUTE_SQL: &str = "/* fatal-execute-probe */ SELECT @P1 AS v";
+
+/// Answers with a severity 20 error and then drops the connection, as SQL
+/// Server does after a fatal error.
+async fn fail_fatally<C: TdsClient>(client: &mut C) -> tiberius::Result<()> {
+    client
+        .send(TdsBackendMessage::TokenPartial(BackendToken::Error(
+            tiberius::TokenError::new(50000, 1, 20, "Fatal error", "test-server", "", 1),
+        )))
+        .await?;
+    client
+        .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+            TokenDone::with_status(DoneStatus::SrvError.into(), 0),
+        )))
+        .await?;
+    drop_connection()
+}
+
 struct TestExecute(Arc<SharedState>);
 
 impl SpExecuteHandler for TestExecute {
@@ -351,6 +390,43 @@ impl SpExecuteHandler for TestExecute {
                     }
                 }
             };
+            if sql == STALLED_EXECUTE_SQL {
+                // Capped so that a cancel that never arrives fails the test
+                // instead of hanging it.
+                for _ in 0..500 {
+                    if client.poll_attention().await? {
+                        return Ok(());
+                    }
+                    smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                }
+                return Err(tiberius::error::Error::Protocol(
+                    "stalled execute was not canceled".into(),
+                ));
+            }
+            if sql == FAILING_EXECUTE_SQL {
+                client
+                    .send(TdsBackendMessage::TokenPartial(BackendToken::Error(
+                        tiberius::TokenError::new(
+                            2627,
+                            1,
+                            14,
+                            "Violation of PRIMARY KEY constraint",
+                            "test-server",
+                            "",
+                            1,
+                        ),
+                    )))
+                    .await?;
+                client
+                    .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                        TokenDone::with_status(DoneStatus::Error.into(), 0),
+                    )))
+                    .await?;
+                return Ok(());
+            }
+            if sql == FATAL_EXECUTE_SQL {
+                return fail_fatally(client).await;
+            }
             let params = collect_params(&request);
             let rows = eval_sql(&sql, &params);
 
@@ -366,6 +442,13 @@ impl SpExecuteHandler for TestExecute {
     }
 }
 
+/// A handler error makes the server end the connection without answering.
+fn drop_connection() -> tiberius::Result<()> {
+    Err(tiberius::error::Error::Protocol(
+        "test harness: dropping the connection".into(),
+    ))
+}
+
 struct TestUnprepare(Arc<SharedState>);
 
 impl SpUnprepareHandler for TestUnprepare {
@@ -379,6 +462,12 @@ impl SpUnprepareHandler for TestUnprepare {
     {
         Box::pin(async move {
             self.0.rpc_log.lock().unwrap().push(RpcProcId::Unprepare);
+            if *self.0.drop_on_release.lock().unwrap() {
+                return drop_connection();
+            }
+            if *self.0.fatal_on_release.lock().unwrap() {
+                return fail_fatally(client).await;
+            }
             self.0.procs.lock().unwrap().unprepare(&request.handle());
             send_return_status(client, 0).await?;
             client
@@ -589,6 +678,28 @@ impl SpCursorCloseHandler for TestCursorClose {
     {
         Box::pin(async move {
             self.0.rpc_log.lock().unwrap().push(RpcProcId::CursorClose);
+            let fail = *self.0.fail_cursor_close.lock().unwrap();
+            if fail {
+                client
+                    .send(TdsBackendMessage::TokenPartial(BackendToken::Error(
+                        tiberius::TokenError::new(
+                            16917,
+                            1,
+                            16,
+                            "Cursor is not open.",
+                            "test-server",
+                            "",
+                            1,
+                        ),
+                    )))
+                    .await?;
+                client
+                    .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                        TokenDone::with_status(DoneStatus::Error.into(), 0),
+                    )))
+                    .await?;
+                return Ok(());
+            }
             self.0.cursors.lock().unwrap().close(&request.handle);
             self.0.cursor_rows.lock().unwrap().remove(&request.handle);
             send_return_status(client, 0).await?;
@@ -812,6 +923,9 @@ impl RpcHandler for SpecialRpc {
                         .lock()
                         .unwrap()
                         .push(RpcProcId::CursorUnprepare);
+                    if *self.0.drop_on_release.lock().unwrap() {
+                        return drop_connection();
+                    }
                     let params = message.into_param_set().await?;
                     let handle = match params.get(0).map(|p| &p.value) {
                         Some(ColumnData::I32(Some(v))) => PreparedHandle::from_i32(*v),
@@ -1020,9 +1134,9 @@ async fn run_server_once(
     process_connection(stream, tls, &*handlers).await
 }
 
-async fn connect_client(
-    addr: SocketAddr,
-) -> tiberius::Result<Client<smol_adapter::Compat<async_net::TcpStream>>> {
+type TestClient = Client<smol_adapter::Compat<async_net::TcpStream>>;
+
+async fn connect_client(addr: SocketAddr) -> tiberius::Result<TestClient> {
     let stream =
         async_net::TcpStream::connect(addr)
             .await
@@ -1038,6 +1152,20 @@ async fn connect_client(
     config.encryption(EncryptionLevel::NotSupported);
     config.trust_cert();
     Client::connect(config, smol_adapter::Compat::new(stream)).await
+}
+
+async fn assert_connection_reusable(client: &mut TestClient) {
+    let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+    let row = stmt
+        .query(client, &[&42i32])
+        .await
+        .unwrap()
+        .into_row()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i32, _>(0), Some(42));
+    stmt.unprepare(client).await.unwrap();
 }
 
 mod smol_adapter {
@@ -1288,6 +1416,108 @@ fn cursor_prep_exec_fetch_close_unprepare() {
                     RpcProcId::CursorUnprepare,
                 ]
             );
+        })
+        .await;
+    });
+}
+
+async fn open_prepared_cursor(
+    client: &mut TestClient,
+) -> (tiberius::PreparedCursor, PreparedHandle) {
+    let cursor = client
+        .cursor_prep_exec(
+            "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
+            CursorOpenOptions::default(),
+            "",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_cursor()
+        .expect("expected prepared cursor");
+    let handle = PreparedHandle::from_i32(cursor.prepared_handle().as_i32());
+    (cursor, handle)
+}
+
+#[test]
+fn prepared_cursor_unprepare_closes_an_open_cursor() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let (cursor, handle) = open_prepared_cursor(&mut client).await;
+
+            cursor.unprepare(&mut client).await.unwrap();
+
+            assert_eq!(
+                *state.rpc_log.lock().unwrap(),
+                [
+                    RpcProcId::CursorPrepExec,
+                    RpcProcId::CursorClose,
+                    RpcProcId::CursorUnprepare,
+                ]
+            );
+            assert!(state.cursor_rows.lock().unwrap().is_empty());
+            assert!(!state.procs.lock().unwrap().contains(&handle));
+            assert_connection_reusable(&mut client).await;
+        })
+        .await;
+    });
+}
+
+#[test]
+fn prepared_cursor_unprepare_releases_the_handle_after_a_failed_close() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let (cursor, handle) = open_prepared_cursor(&mut client).await;
+            *state.fail_cursor_close.lock().unwrap() = true;
+
+            let result = cursor.unprepare(&mut client).await;
+
+            assert_eq!(result.unwrap_err().code(), Some(16917));
+            assert_eq!(
+                state.rpc_log.lock().unwrap()[1..],
+                [RpcProcId::CursorClose, RpcProcId::CursorUnprepare]
+            );
+            assert!(!state.procs.lock().unwrap().contains(&handle));
+            assert_connection_reusable(&mut client).await;
+        })
+        .await;
+    });
+}
+
+/// Asserts that `error` keeps a request's server error `code` and reports
+/// that the release after it failed with the connection, which is gone.
+async fn assert_release_lost_with_connection(
+    client: &mut TestClient,
+    error: tiberius::error::Error,
+    code: u32,
+) {
+    assert_eq!(error.code(), Some(code));
+    assert!(!error.leaves_connection_usable());
+    assert!(
+        matches!(
+            &error,
+            tiberius::error::Error::CleanupFailed { cleanup, .. }
+                if matches!(**cleanup, tiberius::error::Error::Io { .. })
+        ),
+        "expected an I/O cleanup failure, got {error:?}"
+    );
+    assert!(client.simple_query("SELECT 1").await.is_err());
+}
+
+#[test]
+fn prepared_cursor_unprepare_reports_a_release_failure_after_a_failed_close() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let (cursor, _) = open_prepared_cursor(&mut client).await;
+            *state.fail_cursor_close.lock().unwrap() = true;
+            *state.drop_on_release.lock().unwrap() = true;
+
+            let error = cursor.unprepare(&mut client).await.unwrap_err();
+
+            assert_release_lost_with_connection(&mut client, error, 16917).await;
         })
         .await;
     });
@@ -1714,6 +1944,184 @@ fn prepared_statement_is_marked_released_after_unprepare() {
             // Explicitly drop without unprepare — exercises the Drop warn
             // path. Test passes as long as this doesn't panic / hang.
             drop(stmt);
+        })
+        .await;
+    });
+}
+
+#[test]
+fn execute_and_unprepare_returns_counts_and_releases_the_handle() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+            let handle = PreparedHandle::from_i32(stmt.handle().as_i32());
+
+            let (result, error) = stmt.execute_and_unprepare(&mut client, &[&5i32]).await;
+
+            assert!(error.is_none(), "unexpected error: {error:?}");
+            // Both counts are the execution's: the harness ends `sp_execute`
+            // with a counted DONEPROC. The release's response adds none.
+            assert_eq!(result.rows_affected(), &[1, 1]);
+            assert_eq!(*state.rpc_log.lock().unwrap(), [RpcProcId::Unprepare]);
+            assert!(!state.procs.lock().unwrap().contains(&handle));
+            assert_connection_reusable(&mut client).await;
+        })
+        .await;
+    });
+}
+
+#[test]
+fn execute_and_unprepare_releases_the_handle_after_a_server_error() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let stmt = client
+                .prepare(FAILING_EXECUTE_SQL, "@P1 int")
+                .await
+                .unwrap();
+            let handle = PreparedHandle::from_i32(stmt.handle().as_i32());
+
+            let (result, error) = stmt.execute_and_unprepare(&mut client, &[&5i32]).await;
+
+            assert!(result.rows_affected().is_empty());
+            assert_eq!(error.and_then(|error| error.code()), Some(2627));
+            assert!(!state.procs.lock().unwrap().contains(&handle));
+            assert_connection_reusable(&mut client).await;
+        })
+        .await;
+    });
+}
+
+#[test]
+fn execute_and_unprepare_releases_the_handle_after_a_cancel() {
+    // An attention aborts the whole request it interrupts, so the release
+    // must follow in its own request once the cancel has been acknowledged.
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let stmt = client
+                .prepare(STALLED_EXECUTE_SQL, "@P1 int")
+                .await
+                .unwrap();
+            let handle = PreparedHandle::from_i32(stmt.handle().as_i32());
+
+            let token = client.cancellation_token();
+            let canceller = smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                token.cancel();
+            });
+            let start = std::time::Instant::now();
+            let (_result, error) = stmt.execute_and_unprepare(&mut client, &[&5i32]).await;
+            let elapsed = start.elapsed();
+            canceller.await;
+
+            assert!(
+                matches!(error, Some(tiberius::error::Error::Canceled)),
+                "expected Error::Canceled, got {error:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "cancellation did not interrupt the execution: took {elapsed:?}"
+            );
+            assert_eq!(*state.rpc_log.lock().unwrap(), [RpcProcId::Unprepare]);
+            assert!(!state.procs.lock().unwrap().contains(&handle));
+            assert_connection_reusable(&mut client).await;
+        })
+        .await;
+    });
+}
+
+#[test]
+fn execute_and_unprepare_reports_a_release_failure_after_a_server_error() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let stmt = client
+                .prepare(FAILING_EXECUTE_SQL, "@P1 int")
+                .await
+                .unwrap();
+            *state.drop_on_release.lock().unwrap() = true;
+
+            let (result, error) = stmt.execute_and_unprepare(&mut client, &[&5i32]).await;
+
+            assert!(result.rows_affected().is_empty());
+            let error = error.expect("the execution failed");
+            assert_release_lost_with_connection(&mut client, error, 2627).await;
+        })
+        .await;
+    });
+}
+
+#[test]
+fn execute_and_unprepare_skips_the_release_after_a_fatal_execution_error() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let stmt = client.prepare(FATAL_EXECUTE_SQL, "@P1 int").await.unwrap();
+
+            let (_result, error) = stmt.execute_and_unprepare(&mut client, &[&5i32]).await;
+
+            let error = error.expect("the execution failed");
+            assert!(
+                matches!(&error, tiberius::error::Error::Server(e) if e.class() == 20),
+                "expected the fatal server error, got {error:?}"
+            );
+            assert!(!error.leaves_connection_usable());
+            assert!(state.rpc_log.lock().unwrap().is_empty());
+            assert!(client.simple_query("SELECT 1").await.is_err());
+        })
+        .await;
+    });
+}
+
+#[test]
+fn execute_and_unprepare_reports_a_fatal_release_error_after_a_server_error() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let stmt = client
+                .prepare(FAILING_EXECUTE_SQL, "@P1 int")
+                .await
+                .unwrap();
+            *state.fatal_on_release.lock().unwrap() = true;
+
+            let (_result, error) = stmt.execute_and_unprepare(&mut client, &[&5i32]).await;
+
+            let error = error.expect("the execution failed");
+            assert_eq!(error.code(), Some(2627));
+            assert!(
+                matches!(
+                    &error,
+                    tiberius::error::Error::CleanupFailed { cleanup, .. }
+                        if matches!(&**cleanup, tiberius::error::Error::Server(e) if e.class() == 20)
+                ),
+                "expected a fatal cleanup failure, got {error:?}"
+            );
+            assert!(!error.leaves_connection_usable());
+            assert!(client.simple_query("SELECT 1").await.is_err());
+        })
+        .await;
+    });
+}
+
+#[test]
+fn execute_and_unprepare_reports_a_release_failure_after_a_successful_execution() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+            *state.drop_on_release.lock().unwrap() = true;
+
+            let (result, error) = stmt.execute_and_unprepare(&mut client, &[&5i32]).await;
+
+            assert_eq!(result.rows_affected(), &[1, 1]);
+            let error = error.expect("the release failed");
+            assert!(
+                matches!(error, tiberius::error::Error::Io { .. }),
+                "expected an I/O error, got {error:?}"
+            );
+            assert!(!error.leaves_connection_usable());
         })
         .await;
     });

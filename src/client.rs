@@ -38,8 +38,8 @@ use crate::{
     BulkLoadRequest, ColumnFlag, SqlReadBytes, ToSql,
 };
 use codec::{
-    BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, RpcProcIdValue, TokenRpcBatch,
-    TokenRpcRequest, TransactionOutcome, TransactionRequest,
+    BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, RpcProcIdValue, TokenRpcRequest,
+    TransactionOutcome, TransactionRequest,
 };
 use enumflags2::BitFlags;
 use futures_util::io::{AsyncRead, AsyncWrite};
@@ -539,28 +539,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
 
         let id = self.connection.context_mut().next_packet_id();
         self.connection.send(PacketHeader::rpc(id), req).await?;
-
-        Ok(())
-    }
-
-    /// Sends several RPC calls in one request message, so they cost one round
-    /// trip; read the response with `collect_rpc_batch_results`.
-    pub(crate) async fn send_rpc_batch<'b>(
-        &mut self,
-        calls: Vec<(RpcProcIdValue<'b>, Vec<RpcParam<'b>>)>,
-    ) -> crate::Result<()> {
-        let transaction_desc = self.connection.context().transaction_descriptor();
-        let requests = calls
-            .into_iter()
-            .map(|(proc_id, rpc_params)| {
-                TokenRpcRequest::new(proc_id, rpc_params, transaction_desc)
-            })
-            .collect();
-
-        let id = self.connection.context_mut().next_packet_id();
-        self.connection
-            .send(PacketHeader::rpc(id), TokenRpcBatch::new(requests))
-            .await?;
 
         Ok(())
     }

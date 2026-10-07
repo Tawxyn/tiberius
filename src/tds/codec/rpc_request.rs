@@ -102,54 +102,12 @@ impl<'a> From<RpcProcId> for RpcProcIdValue<'a> {
 
 impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
     fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        encode_all_headers(dst, &self.transaction_desc);
-        self.encode_call(dst)
-    }
-}
+        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32);
+        dst.put_u32_le(ALL_HEADERS_LEN_TX as u32 - 4);
+        dst.put_u16_le(AllHeaderTy::TransactionDescriptor as u16);
+        dst.put_slice(&self.transaction_desc);
+        dst.put_u32_le(1);
 
-fn encode_all_headers(dst: &mut BytesMut, transaction_desc: &[u8; 8]) {
-    dst.put_u32_le(ALL_HEADERS_LEN_TX as u32);
-    dst.put_u32_le(ALL_HEADERS_LEN_TX as u32 - 4);
-    dst.put_u16_le(AllHeaderTy::TransactionDescriptor as u16);
-    dst.put_slice(transaction_desc);
-    dst.put_u32_le(1);
-}
-
-/// Separates calls in one RPC request message (TDS 7.2 and later).
-const RPC_BATCH_FLAG: u8 = 0xff;
-
-/// Several RPC calls sent as one request message. The server answers each call
-/// in order, ending each with its own `DONEPROC`. The transaction descriptor is
-/// taken from the first call.
-#[derive(Debug)]
-pub(crate) struct TokenRpcBatch<'a> {
-    requests: Vec<TokenRpcRequest<'a>>,
-}
-
-impl<'a> TokenRpcBatch<'a> {
-    pub(crate) fn new(requests: Vec<TokenRpcRequest<'a>>) -> Self {
-        Self { requests }
-    }
-}
-
-impl<'a> Encode<BytesMut> for TokenRpcBatch<'a> {
-    fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        let mut requests = self.requests.into_iter();
-        let Some(first) = requests.next() else {
-            return Err(crate::Error::Protocol("empty RPC batch".into()));
-        };
-        first.encode(dst)?;
-        for request in requests {
-            dst.put_u8(RPC_BATCH_FLAG);
-            request.encode_call(dst)?;
-        }
-        Ok(())
-    }
-}
-
-impl<'a> TokenRpcRequest<'a> {
-    /// Encodes `RPCReqBatch`: the procedure, option flags, and parameters.
-    fn encode_call(self, dst: &mut BytesMut) -> Result<()> {
         match self.proc_id {
             RpcProcIdValue::Id(ref id) => {
                 let val = (0xffff_u32) | ((*id as u16) as u32) << 16;
@@ -232,45 +190,6 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rpc_batch_sends_headers_once_and_separates_calls() {
-        let desc = [1, 2, 3, 4, 5, 6, 7, 8];
-        let call = |proc_id, value| {
-            TokenRpcRequest::new(
-                proc_id,
-                vec![RpcParam {
-                    name: Cow::Borrowed(""),
-                    flags: BitFlags::empty(),
-                    type_info: None,
-                    value: ColumnData::I32(Some(value)),
-                }],
-                desc,
-            )
-        };
-        let mut first = BytesMut::new();
-        call(RpcProcId::CursorClose, 7).encode(&mut first).unwrap();
-        let mut second = BytesMut::new();
-        call(RpcProcId::CursorUnprepare, 9)
-            .encode(&mut second)
-            .unwrap();
-
-        let mut batch = BytesMut::new();
-        TokenRpcBatch::new(vec![
-            call(RpcProcId::CursorClose, 7),
-            call(RpcProcId::CursorUnprepare, 9),
-        ])
-        .encode(&mut batch)
-        .unwrap();
-
-        let mut expected = first.to_vec();
-        expected.push(RPC_BATCH_FLAG);
-        expected.extend_from_slice(&second[ALL_HEADERS_LEN_TX..]);
-        assert_eq!(batch.to_vec(), expected);
-        assert!(TokenRpcBatch::new(Vec::new())
-            .encode(&mut BytesMut::new())
-            .is_err());
-    }
 
     #[test]
     fn encode_proc_id_uses_ffff_sentinel() {

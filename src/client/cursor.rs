@@ -16,10 +16,9 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use tracing::{event, Level};
 
 use crate::client::rpc_response::{
-    collect_metadata_only_rpc, collect_rpc_batch_results, collect_rpc_outputs, BufferedResultSet,
-    OutputValue,
+    collect_metadata_only_rpc, collect_rpc_outputs, BufferedResultSet, OutputValue,
 };
-use crate::tds::codec::{ColumnData, RpcParam, RpcProcId, RpcProcIdValue, RpcStatus, TokenInfo};
+use crate::tds::codec::{ColumnData, RpcParam, RpcProcId, RpcStatus, TokenInfo};
 use crate::tds::stream::{QueryStream, TokenStream};
 use crate::{Client, Column, PreparedHandle, Row, ToSql};
 
@@ -317,37 +316,41 @@ impl PreparedCursor {
 
     /// Release the prepared handle, closing the cursor first if needed.
     ///
-    /// An open cursor is closed in the same request as the unprepare, so the
-    /// two cost one round trip. The unprepare is sent even when the close then
-    /// fails; a close error is returned in preference to an unprepare error.
+    /// The handle is released even when closing the cursor fails, as long as
+    /// the connection can still carry a request, so a cursor the server has
+    /// already closed does not strand its prepared statement. When both
+    /// fail, the error is [`CleanupFailed`](crate::error::Error::CleanupFailed),
+    /// which keeps the close's error and its code. Whenever the error's
+    /// [`leaves_connection_usable`](crate::error::Error::leaves_connection_usable)
+    /// is `false`, the connection should be discarded.
     pub async fn unprepare<S>(mut self, client: &mut Client<S>) -> crate::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        client.connection.flush_stream().await?;
-        let unprepare: (RpcProcIdValue<'static>, _) = (
-            RpcProcId::CursorUnprepare.into(),
-            vec![build_unprepare_param(self.prepared_handle)],
-        );
-        let Some(mut cursor) = self.cursor.take() else {
-            client.send_rpc(unprepare.0, unprepare.1).await?;
-            self.released = true;
-            collect_rpc_outputs(&mut client.connection).await?;
-            return Ok(());
-        };
-        client
-            .send_rpc_batch(vec![
-                (RpcProcId::CursorClose.into(), cursor.close_params()),
-                unprepare,
-            ])
-            .await?;
-        // As in `Cursor::close`, both handles are gone from the server's
-        // perspective once the request is processed.
-        cursor.closed = true;
-        self.released = true;
-        for result in collect_rpc_batch_results(&mut client.connection, 2).await? {
-            result?;
+        let closed = self.close_cursor(client).await;
+        if let Err(error) = &closed {
+            if !error.leaves_connection_usable() {
+                return closed;
+            }
         }
+        let released = self.release(client).await;
+        match crate::Error::with_cleanup(closed.err(), released) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn release<S>(&mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        client.connection.flush_stream().await?;
+        let handle_param = build_unprepare_param(self.prepared_handle);
+        client
+            .send_rpc(RpcProcId::CursorUnprepare, vec![handle_param])
+            .await?;
+        self.released = true;
+        collect_rpc_outputs(&mut client.connection).await?;
         Ok(())
     }
 
@@ -611,15 +614,6 @@ impl Cursor {
         Ok(result)
     }
 
-    fn close_params(&self) -> Vec<RpcParam<'static>> {
-        vec![RpcParam {
-            name: Cow::Borrowed(""),
-            flags: BitFlags::empty(),
-            type_info: None,
-            value: ColumnData::I32(Some(self.handle.as_i32())),
-        }]
-    }
-
     /// Close the cursor and release its server-side resources.
     ///
     /// The cursor is flagged closed as soon as the `sp_cursorclose` packet
@@ -632,9 +626,13 @@ impl Cursor {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         client.connection.flush_stream().await?;
-        client
-            .send_rpc(RpcProcId::CursorClose, self.close_params())
-            .await?;
+        let rpc_params = vec![RpcParam {
+            name: Cow::Borrowed(""),
+            flags: BitFlags::empty(),
+            type_info: None,
+            value: ColumnData::I32(Some(self.handle.as_i32())),
+        }];
+        client.send_rpc(RpcProcId::CursorClose, rpc_params).await?;
         // From the server's POV the handle is released the moment the RPC
         // is processed; anything surfaced while draining is informational.
         self.closed = true;

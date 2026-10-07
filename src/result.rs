@@ -1,6 +1,7 @@
 pub use crate::tds::stream::{QueryItem, ResultMetadata};
 use crate::{
     client::Connection,
+    tds::codec::DoneStatus,
     tds::stream::{ReceivedToken, TokenStream},
 };
 use futures_util::io::{AsyncRead, AsyncWrite};
@@ -78,6 +79,11 @@ impl<'a> ExecuteResult {
     /// error, or with the transport, protocol, or cancellation error that
     /// ended the response. A server error does not end the response, so the
     /// rest of it is drained and its counts are dropped.
+    ///
+    /// Unlike `new`, it records a count only from a `DONE` variant flagged
+    /// `DONE_COUNT`, the only ones whose count the server defines. Others,
+    /// such as the end of a nested procedure or of a statement run with
+    /// `NOCOUNT` on, would otherwise add a count of zero.
     pub(crate) async fn until_error<S: AsyncRead + AsyncWrite + Unpin + Send>(
         connection: &'a mut Connection<S>,
     ) -> (Self, Option<crate::Error>) {
@@ -119,12 +125,15 @@ impl<'a> ExecuteResult {
                     | ReceivedToken::DoneInProc(_)
                     | ReceivedToken::Done(_),
                 )) if server_error.is_some() => (),
-                Ok(Some(ReceivedToken::DoneProc(done))) if done.is_final() => (),
                 Ok(Some(
                     ReceivedToken::DoneProc(done)
                     | ReceivedToken::DoneInProc(done)
                     | ReceivedToken::Done(done),
-                )) => rows_affected.push(done.rows()),
+                )) => {
+                    if done.status().contains(DoneStatus::Count) {
+                        rows_affected.push(done.rows());
+                    }
+                }
                 Ok(Some(token)) => visit(token),
                 Ok(None) => break,
                 // The token stream raises its first server error again at the end.
@@ -187,6 +196,7 @@ impl IntoIterator for ExecuteResult {
 mod tests {
     use super::*;
     use crate::tds::codec::{TokenDone, TokenError};
+    use enumflags2::BitFlags;
     use futures_util::stream::iter;
 
     fn in_proc(rows: u64) -> crate::Result<ReceivedToken> {
@@ -234,6 +244,49 @@ mod tests {
     async fn until_error_returns_every_count_of_a_successful_response() {
         let (rows, error) = read(vec![in_proc(1), in_proc(0), in_proc(2), final_done_proc()]).await;
         assert_eq!(rows, [1, 0, 2]);
+        assert!(error.is_none());
+    }
+
+    fn done_proc(status: BitFlags<DoneStatus>, rows: u64) -> crate::Result<ReceivedToken> {
+        Ok(ReceivedToken::DoneProc(TokenDone::with_status(
+            status, rows,
+        )))
+    }
+
+    #[tokio::test]
+    async fn until_error_skips_done_tokens_without_a_count() {
+        let (rows, error) = read(vec![
+            in_proc(1),
+            // The end of a call that is not the last in an RPC batch.
+            done_proc(DoneStatus::RpcInBatch.into(), 0),
+            in_proc(2),
+            // The end of a procedure the statement called.
+            done_proc(DoneStatus::More.into(), 0),
+            // A statement run with NOCOUNT on.
+            Ok(ReceivedToken::DoneInProc(TokenDone::with_status(
+                DoneStatus::More.into(),
+                0,
+            ))),
+            in_proc(0),
+            final_done_proc(),
+        ])
+        .await;
+        assert_eq!(rows, [1, 2, 0]);
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn until_error_counts_every_done_variant_that_carries_a_count() {
+        // A count does not say which statement it belongs to, so one from a
+        // statement in a called procedure or a trigger is recorded like one
+        // from the executed statement.
+        let (rows, error) = read(vec![
+            in_proc(2),
+            done_proc(DoneStatus::More | DoneStatus::Count, 5),
+            Ok(ReceivedToken::Done(TokenDone::with_rows(1))),
+        ])
+        .await;
+        assert_eq!(rows, [2, 5, 1]);
         assert!(error.is_none());
     }
 
